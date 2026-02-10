@@ -8,7 +8,8 @@ app.use(express.json());
 
 // ONE PRODUCT = ONE PAYHIP SECRET KEY
 const PAYHIP_SECRETS = {
-  "CraftingSystem": "prod_sk_KBup9_a530f9cdfd350fff471a5f8626b9db0b7a09a397"
+  "CraftingSystem": "prod_sk_KBup9_a530f9cdfd350fff471a5f8626b9db0b7a09a397",
+  "CharacterCreation": "prod_sk_qn4km_e4160de7181a828134467f7bd3b97a8f9a03de3f"
 };
 
 const PAYHIP_URL = "https://payhip.com/api/v2/license/verify";
