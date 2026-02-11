@@ -1,22 +1,9 @@
-// bot.js
-import { Client, GatewayIntentBits, SlashCommandBuilder, Routes } from "discord.js";
-import { REST } from "@discordjs/rest";
+import express from "express";
 import axios from "axios";
 import sqlite3 from "sqlite3";
 import http from "http";
-
-// ===============================
-// KEEP-ALIVE HTTP SERVER (RENDER)
-// ===============================
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Bot is running");
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`HTTP server listening on port ${PORT}`);
-});
+import { Client, GatewayIntentBits, SlashCommandBuilder, Routes } from "discord.js";
+import { REST } from "@discordjs/rest";
 
 // ===============================
 // ENV VARIABLES
@@ -25,11 +12,11 @@ const DISCORD_TOKEN = process.env.BOTTOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const CUSTOMER_ROLE_ID = process.env.CUSTOMER_ROLE_ID;
+const PORT = process.env.PORT || 3000;
+
 const PAYHIP_URL = "https://payhip.com/api/v2/license/verify";
 
-// ===============================
-// PAYHIP PRODUCTS
-// ===============================
+// SAME secrets used for BOTH Roblox + Discord
 const PAYHIP_PRODUCTS = {
   CraftingSystem: process.env.PAYHIP_SECRET_1,
   CharacterCreation: process.env.PAYHIP_SECRET_2,
@@ -44,30 +31,82 @@ const PAYHIP_PRODUCTS = {
 };
 
 // ===============================
-// DATABASE
+// DATABASE (SHARED)
 // ===============================
-const db = new sqlite3.Database("./redeems.db");
+const db = new sqlite3.Database("./licenses.db");
+
 db.run(`
-  CREATE TABLE IF NOT EXISTS redeems (
-    licenseKey TEXT UNIQUE,
-    discordUserId TEXT UNIQUE,
-    productId TEXT
+  CREATE TABLE IF NOT EXISTS licenses (
+    licenseKey TEXT PRIMARY KEY,
+    productId TEXT,
+    discordUserId TEXT,
+    robloxUserId TEXT
   )
 `);
 
 // ===============================
-// DISCORD CLIENT
+// EXPRESS SERVER (ROBLOX API)
 // ===============================
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
-  ],
+const app = express();
+app.use(express.json());
+
+// Keep alive endpoint
+app.get("/", (_, res) => {
+  res.send("Server running 24/7");
+});
+
+// Roblox verification
+app.post("/verify", async (req, res) => {
+  const { licenseKey, robloxUserId, productId } = req.body;
+
+  if (!licenseKey || !robloxUserId || !productId)
+    return res.json({ success: false, error: "Missing data" });
+
+  const secret = PAYHIP_PRODUCTS[productId];
+  if (!secret)
+    return res.json({ success: false, error: "Unknown product" });
+
+  try {
+    const r = await axios.get(PAYHIP_URL, {
+      params: { license_key: licenseKey },
+      headers: { "product-secret-key": secret }
+    });
+
+    if (!r.data?.data?.enabled)
+      return res.json({ success: false, error: "Invalid license" });
+
+    db.get("SELECT * FROM licenses WHERE licenseKey = ?", [licenseKey], (err, row) => {
+
+      if (row && row.robloxUserId && row.robloxUserId !== robloxUserId)
+        return res.json({ success: false, error: "License already used on another Roblox account" });
+
+      if (!row) {
+        db.run(
+          "INSERT INTO licenses VALUES (?, ?, NULL, ?)",
+          [licenseKey, productId, robloxUserId]
+        );
+      } else {
+        db.run(
+          "UPDATE licenses SET robloxUserId = ? WHERE licenseKey = ?",
+          [robloxUserId, licenseKey]
+        );
+      }
+
+      return res.json({ success: true });
+    });
+
+  } catch {
+    res.json({ success: false, error: "Server error" });
+  }
 });
 
 // ===============================
-// SLASH COMMAND
+// DISCORD BOT
 // ===============================
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
+});
+
 const commands = [
   new SlashCommandBuilder()
     .setName("redeem")
@@ -79,34 +118,15 @@ const commands = [
     )
 ].map(c => c.toJSON());
 
-// ===============================
-// REGISTER COMMANDS
-// ===============================
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
 (async () => {
-  try {
-    console.log("Registering slash commands...");
-    await rest.put(
-      Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-      { body: commands }
-    );
-    console.log("Commands registered!");
-  } catch (err) {
-    console.error("Error registering commands:", err);
-  }
+  await rest.put(
+    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+    { body: commands }
+  );
 })();
 
-// ===============================
-// READY
-// ===============================
-client.once("ready", () => {
-  console.log(`Bot online as ${client.user.tag}`);
-});
-
-// ===============================
-// REDEEM HANDLER
-// ===============================
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "redeem") return;
@@ -114,70 +134,55 @@ client.on("interactionCreate", async interaction => {
   const licenseKey = interaction.options.getString("key");
   const discordUserId = interaction.user.id;
 
-  db.get(
-    "SELECT * FROM redeems WHERE discordUserId = ?",
-    [discordUserId],
-    async (_, row) => {
-      if (row) {
-        return interaction.reply({
-          content: "❌ You have already redeemed a license.",
-          ephemeral: true
-        });
-      }
-
-      for (const [productId, secret] of Object.entries(PAYHIP_PRODUCTS)) {
-        try {
-          const r = await axios.get(PAYHIP_URL, {
-            params: { license_key: licenseKey },
-            headers: { "product-secret-key": secret }
-          });
-
-          if (r.data?.data?.enabled) {
-            db.get(
-              "SELECT * FROM redeems WHERE licenseKey = ?",
-              [licenseKey],
-              async (_, used) => {
-                if (used) {
-                  return interaction.reply({
-                    content: "❌ This license key has already been redeemed.",
-                    ephemeral: true
-                  });
-                }
-
-                db.run(
-                  "INSERT INTO redeems VALUES (?, ?, ?)",
-                  [licenseKey, discordUserId, productId]
-                );
-
-                try {
-                  const member = await interaction.guild.members.fetch(discordUserId);
-                  await member.roles.add(CUSTOMER_ROLE_ID);
-                } catch (e) {
-                  console.error(e);
-                }
-
-                return interaction.reply({
-                  content: `✅ License verified for **${productId}**! You now have customer access.`,
-                  ephemeral: true
-                });
-              }
-            );
-            return;
-          }
-        } catch {
-          // try next product
-        }
-      }
-
-      interaction.reply({
-        content: "❌ Invalid or already used license key.",
-        ephemeral: true
+  for (const [productId, secret] of Object.entries(PAYHIP_PRODUCTS)) {
+    try {
+      const r = await axios.get(PAYHIP_URL, {
+        params: { license_key: licenseKey },
+        headers: { "product-secret-key": secret }
       });
-    }
-  );
+
+      if (r.data?.data?.enabled) {
+
+        db.get("SELECT * FROM licenses WHERE licenseKey = ?", [licenseKey], async (_, row) => {
+
+          if (row && row.discordUserId && row.discordUserId !== discordUserId)
+            return interaction.reply({ content: "❌ License already used.", ephemeral: true });
+
+          if (!row) {
+            db.run(
+              "INSERT INTO licenses VALUES (?, ?, ?, NULL)",
+              [licenseKey, productId, discordUserId]
+            );
+          } else {
+            db.run(
+              "UPDATE licenses SET discordUserId = ? WHERE licenseKey = ?",
+              [discordUserId, licenseKey]
+            );
+          }
+
+          const member = await interaction.guild.members.fetch(discordUserId);
+          await member.roles.add(CUSTOMER_ROLE_ID);
+
+          return interaction.reply({
+            content: `✅ Verified for **${productId}**`,
+            ephemeral: true
+          });
+        });
+
+        return;
+      }
+    } catch {}
+  }
+
+  interaction.reply({ content: "❌ Invalid license.", ephemeral: true });
 });
 
-// ===============================
-// LOGIN
-// ===============================
 client.login(DISCORD_TOKEN);
+
+// ===============================
+// START SERVER (24/7 ON RENDER)
+// ===============================
+app.listen(PORT, () => {
+  console.log("Server + Bot running on port", PORT);
+});
+
