@@ -1,7 +1,6 @@
 import express from "express";
 import axios from "axios";
 import sqlite3 from "sqlite3";
-import http from "http";
 import { Client, GatewayIntentBits, SlashCommandBuilder, Routes } from "discord.js";
 import { REST } from "@discordjs/rest";
 
@@ -16,7 +15,9 @@ const PORT = process.env.PORT || 3000;
 
 const PAYHIP_URL = "https://payhip.com/api/v2/license/verify";
 
-// SAME secrets used for BOTH Roblox + Discord
+// ===============================
+// PAYHIP PRODUCTS (FROM ENV)
+// ===============================
 const PAYHIP_PRODUCTS = {
   CraftingSystem: process.env.PAYHIP_SECRET_1,
   CharacterCreation: process.env.PAYHIP_SECRET_2,
@@ -31,7 +32,7 @@ const PAYHIP_PRODUCTS = {
 };
 
 // ===============================
-// DATABASE (SHARED)
+// DATABASE
 // ===============================
 const db = new sqlite3.Database("./licenses.db");
 
@@ -39,27 +40,28 @@ db.run(`
   CREATE TABLE IF NOT EXISTS licenses (
     licenseKey TEXT PRIMARY KEY,
     productId TEXT,
-    discordUserId TEXT,
-    robloxUserId TEXT
+    creatorType TEXT,
+    creatorId TEXT,
+    discordUserId TEXT
   )
 `);
 
 // ===============================
-// EXPRESS SERVER (ROBLOX API)
+// EXPRESS SERVER (ROBLOX VERIFY)
 // ===============================
 const app = express();
 app.use(express.json());
 
-// Keep alive endpoint
+// Health check for Render
 app.get("/", (_, res) => {
-  res.send("Server running 24/7");
+  res.send("License server running");
 });
 
-// Roblox verification
+// Roblox License Verification
 app.post("/verify", async (req, res) => {
-  const { licenseKey, robloxUserId, productId } = req.body;
+  const { licenseKey, productId, creatorType, creatorId } = req.body;
 
-  if (!licenseKey || !robloxUserId || !productId)
+  if (!licenseKey || !productId || !creatorType || !creatorId)
     return res.json({ success: false, error: "Missing data" });
 
   const secret = PAYHIP_PRODUCTS[productId];
@@ -77,26 +79,25 @@ app.post("/verify", async (req, res) => {
 
     db.get("SELECT * FROM licenses WHERE licenseKey = ?", [licenseKey], (err, row) => {
 
-      if (row && row.robloxUserId && row.robloxUserId !== robloxUserId)
-        return res.json({ success: false, error: "License already used on another Roblox account" });
+      // If license already locked to another creator
+      if (row && row.creatorId && row.creatorId !== creatorId) {
+        return res.json({ success: false, error: "License already used in another game" });
+      }
 
+      // First time use → lock it
       if (!row) {
         db.run(
-          "INSERT INTO licenses VALUES (?, ?, NULL, ?)",
-          [licenseKey, productId, robloxUserId]
-        );
-      } else {
-        db.run(
-          "UPDATE licenses SET robloxUserId = ? WHERE licenseKey = ?",
-          [robloxUserId, licenseKey]
+          "INSERT INTO licenses VALUES (?, ?, ?, ?, NULL)",
+          [licenseKey, productId, creatorType, creatorId]
         );
       }
 
       return res.json({ success: true });
     });
 
-  } catch {
-    res.json({ success: false, error: "Server error" });
+  } catch (err) {
+    console.error("Verify error:", err);
+    return res.json({ success: false, error: "Server error" });
   }
 });
 
@@ -120,13 +121,25 @@ const commands = [
 
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
+// Register slash command
 (async () => {
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-    { body: commands }
-  );
+  try {
+    await rest.put(
+      Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+      { body: commands }
+    );
+    console.log("Slash commands registered.");
+  } catch (err) {
+    console.error("Slash command error:", err);
+  }
 })();
 
+// Discord Ready
+client.once("ready", () => {
+  console.log(`Bot online as ${client.user.tag}`);
+});
+
+// Discord Redeem Handler
 client.on("interactionCreate", async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== "redeem") return;
@@ -150,7 +163,7 @@ client.on("interactionCreate", async interaction => {
 
           if (!row) {
             db.run(
-              "INSERT INTO licenses VALUES (?, ?, ?, NULL)",
+              "INSERT INTO licenses VALUES (?, ?, NULL, NULL, ?)",
               [licenseKey, productId, discordUserId]
             );
           } else {
@@ -160,11 +173,15 @@ client.on("interactionCreate", async interaction => {
             );
           }
 
-          const member = await interaction.guild.members.fetch(discordUserId);
-          await member.roles.add(CUSTOMER_ROLE_ID);
+          try {
+            const member = await interaction.guild.members.fetch(discordUserId);
+            await member.roles.add(CUSTOMER_ROLE_ID);
+          } catch (e) {
+            console.error("Role error:", e);
+          }
 
           return interaction.reply({
-            content: `✅ Verified for **${productId}**`,
+            content: `✅ License verified for **${productId}**`,
             ephemeral: true
           });
         });
@@ -174,15 +191,14 @@ client.on("interactionCreate", async interaction => {
     } catch {}
   }
 
-  interaction.reply({ content: "❌ Invalid license.", ephemeral: true });
+  return interaction.reply({ content: "❌ Invalid license.", ephemeral: true });
 });
 
 client.login(DISCORD_TOKEN);
 
 // ===============================
-// START SERVER (24/7 ON RENDER)
+// START SERVER
 // ===============================
 app.listen(PORT, () => {
   console.log("Server + Bot running on port", PORT);
 });
-
